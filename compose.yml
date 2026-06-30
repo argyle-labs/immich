@@ -1,9 +1,0 @@
-services:
-  immich:
-    image: ghcr.io/scottdkey/immich:latest
-    container_name: immich
-    restart: unless-stopped
-    ports:
-      - "2283:2283"
-    volumes:
-      - /opt/immich/config:/config
