@@ -14,7 +14,11 @@ immich is multi-service — deploy it **by hand, without orca** from the upstrea
 
 ## Run it without orca
 
-Follow the upstream install (which provides the official multi-container `docker-compose`): <https://immich.app/>.
+Follow the upstream install (which provides the official multi-container `docker-compose`, runnable under docker or podman; deployable to an LXC, VM, or Unraid): <https://immich.app/>.
+
+### Dependencies
+
+Requires PostgreSQL (with pgvecto.rs) and Redis — the upstream compose provisions both.
 
 
 See [immich.md](docs/immich.md) for worked operator notes.
