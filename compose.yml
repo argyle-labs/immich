@@ -1,0 +1,70 @@
+# Immich - Photo and Video Backup
+# docs: ../../docs/services/immich.md
+#
+# Note: Includes its own PostgreSQL and Redis dependencies.
+
+services:
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:${IMMICH_IMAGE_TAG:-release}
+    environment:
+      - TZ=${TZ:-America/Denver}
+      - DB_HOSTNAME=immich-postgres
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=${IMMICH_DB_PASSWORD:-immich}
+      - DB_DATABASE_NAME=immich
+      - REDIS_HOSTNAME=immich-redis
+    ports:
+      - '2283:2283'
+    volumes:
+      - ${IMMICH_UPLOAD_PATH:-/mnt/pool/data/photos}:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      immich-redis:
+        condition: service_healthy
+      immich-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:2283/api/server/ping']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_IMAGE_TAG:-release}
+    environment:
+      - TZ=${TZ:-America/Denver}
+      - SERVER_URL=http://immich-server:2283
+    volumes:
+      - immich_model_cache:/cache
+    depends_on:
+      immich-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  immich-redis:
+    image: docker.io/redis:6.2-alpine
+    healthcheck:
+      test: redis-cli ping || exit 1
+    restart: unless-stopped
+
+  immich-postgres:
+    image: docker.io/tensorchord/pgvecto-rs:pg14-v0.2.0
+    environment:
+      - POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD:-immich}
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=immich
+      - POSTGRES_INITDB_ARGS='--data-checksums'
+    volumes:
+      - immich_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready --dbname='immich' --username='postgres' || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  immich_model_cache:
+  immich_postgres_data:
