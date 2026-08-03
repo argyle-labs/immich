@@ -1,171 +1,104 @@
-# Immich
+# Immich — operator notes
 
-Self-hosted photo and video backup — Google Photos alternative. Includes PostgreSQL, Redis, and a machine learning container for face/object recognition.
+[Immich](https://immich.app/) is a high-performance, self-hosted photo and
+video backup server — a Google Photos alternative. It is **multi-service**:
+the API/web server, a PostgreSQL database (with the pgvecto.rs vector
+extension), Redis, and a machine-learning container for face and object
+recognition and smart search.
 
-- **Port**: 2283
-- **Planned host**: <host> (Docker VM on <host>, <ip>)
-- **Type**: Docker multi-container stack (server + postgres + redis + machine-learning)
-- **Tier**: 1 — Core Data (photos are irreplaceable)
+- **Web / API port**: `2283`
+- **Runtime**: the upstream multi-container compose, runnable under docker or
+  podman, deployable to an LXC, VM, or Unraid.
+- **Dependencies**: PostgreSQL (pgvecto.rs) + Redis — both provisioned by the
+  upstream compose.
 
-See [lxc-ha-plan.md](../infrastructure/lxc-ha-plan.md) for placement rules and failover.
-
----
-
-## Data Architecture
-
-Photos (the actual files) must live on <host> NFS — not inside the Docker container or on <host>'s local disk. This ensures photos survive any single host failure.
-
-| Data | Location | Backed up by |
-|------|----------|-------------|
-| Photos / videos | `<host>:/mnt/user/data/photos` → `/mnt/<host>/data/photos` | Syncthing (<host> → <host>) |
-| PostgreSQL database | Docker named volume `immich_immich_postgres_data` (local to <host>) | Nightly pg_dump to <host> backups |
-| ML model cache | Docker named volume `immich_immich_model_cache` (local to <host>) | Not backed up — re-downloads automatically |
-
-> The Postgres DB is critical. Without it Immich cannot read or organize photos. Back it up separately — a DB dump is more reliable than a filesystem backup of the postgres data directory.
+These are generic operator notes for this plugin. For install and configuration
+reference, follow the upstream docs at <https://immich.app/>.
 
 ---
 
-## Setup (on <host>)
+## Service state
 
-Prerequisites: <host> VM must be running with Docker installed and NFS mounted. See [<host>-setup.md](../infrastructure/<host>-setup.md).
+Immich's persistent state is a small number of volumes. Everything else
+(images, containers) is reproducible from the compose file.
 
-### Step 1 — Create photos directory on NFS
+| Data | What it is | Notes |
+|------|------------|-------|
+| Upload library | The original photos and videos plus generated thumbnails | The irreplaceable data — the bulk of the volume size. |
+| PostgreSQL database | Albums, users, faces, smart-search vectors, metadata | Critical: without it Immich cannot organize or read the library. |
+| ML model cache | Downloaded machine-learning models | Not worth backing up — re-downloads automatically. |
 
-```bash
-# Run from any host with <host> mounted (e.g. <host>)
-mkdir -p /mnt/<host>/data/photos
-```
-
-> Postgres and ML model cache use Docker named volumes (`immich_immich_postgres_data`, `immich_immich_model_cache`) — Docker creates these automatically on first deploy. No local appdata dirs needed for immich.
-
-### Step 2 — Set NFS permissions on <host>
-
-```bash
-# On <host>
-chown nobody:users /mnt/user/data/photos
-chmod 775 /mnt/user/data/photos
-```
-
-### Step 3 — Deploy via Portainer
-
-In Portainer on <host> → **Stacks → Add Stack → Git Repository**:
-
-- Repo: `<github-org>/<repo>`, branch: `main`
-- Compose file: `compose/immich/docker-compose.yml`
-- Credentials: `github`
-- Auto-update: 5 minutes
-
-Set environment variables in Portainer:
-
-```
-TZ=Etc/UTC
-IMMICH_IMAGE_TAG=release
-IMMICH_DB_PASSWORD=<strong-password — set in Portainer, never commit to repo>
-IMMICH_UPLOAD_PATH=/mnt/<host>/data/photos
-```
-
-> `IMMICH_UPLOAD_PATH` points directly at the photos NFS path — maps to `/usr/src/app/upload` inside the container. Photos are kept separate from the media library (`/mnt/<host>/data/media`).
-> `IMMICH_DB_PASSWORD` must match across both the server and postgres containers. If you change it after first deploy, you must wipe the postgres volume and redeploy (postgres initializes with whatever password it sees on first start).
-
-### Step 4 — Initial Immich setup
-
-Access: **http://<ip>:2283**
-
-1. Create admin account
-2. Confirm upload path is set to `/usr/src/app/upload` (which maps to the NFS photos path via compose volume)
-3. Enable machine learning for face recognition and smart search (uses the ML container automatically)
+Keep the upload library and the database together as a consistent set: a
+database that references files no longer present (or vice versa) will need a
+library re-scan to reconcile.
 
 ---
 
-## Backup
+## Deploy
 
-### Nightly backup script
+Deploy the upstream compose on any supported runtime (docker or podman; bare, in
+an LXC, a VM, or on Unraid). Set the required environment (timezone, image tag,
+the database password, and the upload location) per the upstream reference, then
+start the stack.
 
-Run on <host>. Backs up the Postgres DB (via `pg_dump`) and Immich config to <host>.
+First-run setup, in the web UI at `http://<server>:2283`:
 
-```bash
-cat > /usr/local/bin/backup-immich.sh << 'EOF'
-#!/bin/sh
-set -e
+1. Create the admin account.
+2. Confirm the upload location.
+3. Enable machine learning for face recognition and smart search.
 
-DEST=/mnt/<host>/backups/appdata_<host>/immich
-DATE=$(date +%Y%m%d_%H%M%S)
-mkdir -p "$DEST"
+> The database password must match between the server and postgres containers.
+> PostgreSQL initializes with whatever password it sees on first start — if you
+> change it later you must reinitialize the postgres volume.
 
-# PostgreSQL dump (more reliable than backing up the named volume directly)
-docker exec immich-immich-postgres-1 pg_dumpall -U postgres | gzip > "$DEST/immich_db_${DATE}.sql.gz"
+---
 
-# Keep 14 most recent DB dumps
-ls -dt "$DEST"/immich_db_*.sql.gz | tail -n +15 | xargs -r rm -f
+## Backup & restore
 
-echo "Backup complete: $DATE"
-EOF
-chmod +x /usr/local/bin/backup-immich.sh
+Immich's whole state is the volumes above. Back them up as a consistent set —
+stop the container first for a clean copy — and restore by putting them back and
+starting the service. A logical database dump (`pg_dumpall`) is a more portable
+and reliable capture of the database than a raw copy of the postgres data
+directory.
 
-# Alpine uses crontab, not cron.d
-(crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/backup-immich.sh >> /var/log/backup-immich.log 2>&1") | crontab -
+> With orca this is **`service.backup` / `service.restore`** — location-agnostic
+> (docker / podman / lxc / vm), one command regardless of where Immich runs.
+> There is no per-service backup script.
+
+```sh
+orca service.backup immich    # location-agnostic backup
+orca service.restore immich   # restore that backup
 ```
 
----
-
-## Failover Procedure
-
-If <host> goes down:
-
-1. Photos are on <host> NFS — safe. The data is not lost.
-2. Stand up a new <host> VM on <host> (or temporarily on <host>)
-3. Install Docker, mount same NFS paths — see [<host>-setup.md](../infrastructure/<host>-setup.md)
-4. Restore Postgres DB:
-   ```bash
-   # Start just the postgres container first
-   docker compose -p immich up -d immich-postgres
-   # Restore from latest dump
-   gunzip -c /mnt/<host>/backups/appdata_<host>/immich/immich_db_<latest>.sql.gz \
-     | docker exec -i immich-immich-postgres-1 psql -U postgres
-   ```
-5. Deploy Immich stack — it reconnects to the restored database
-6. Photos are on NFS — no restore needed for the actual files
+After a database restore, trigger a library re-scan from the UI
+(**Administration → Jobs → Library → Scan All Libraries**) so Immich reconciles
+the restored database against the files on disk.
 
 ---
 
-## Resource Notes
+## Resource notes
 
-- **Machine learning container** needs ~4 GB RAM for face recognition — plan <host>'s RAM accordingly (8 GB minimum for the full stack)
-- ML processing is CPU-bound; no GPU required
-- Photo upload speed is limited by NFS write throughput — ensure <host> is healthy before bulk imports
+- The machine-learning container is the memory-hungry component; plan RAM for
+  the full stack accordingly.
+- ML processing is CPU-bound — no GPU is required.
+- Bulk imports are limited by the write throughput of the upload volume's
+  storage.
 
 ---
 
 ## Troubleshooting
 
-```bash
-# Check all containers are running
+```sh
+# Are all the containers up?
 docker compose ps
 
-# Follow logs
+# Follow logs for a specific service
 docker compose logs -f immich-server
 docker compose logs -f immich-postgres
 docker compose logs -f immich-machine-learning
 ```
 
-### Database won't start
-
-Check postgres data directory permissions:
-```bash
-ls -la /opt/appdata/immich/postgres/
-# Should be owned by 999:999 (postgres container user)
-chown -R 999:999 /opt/appdata/immich/postgres
-```
-
-### Photos not showing after restore
-
-Trigger a re-scan after DB restore:
-In Immich UI → **Administration → Jobs → Library → Scan All Libraries**
-
----
-
-## Related Documentation
-
-- [<host>-setup.md](../infrastructure/<host>-setup.md) — Docker VM setup (Immich runs here)
-- [lxc-ha-plan.md](../infrastructure/lxc-ha-plan.md) — tier 1 data resilience requirements
-- [<host>-shares.md](../infrastructure/<host>-shares.md) — NFS share layout, Syncthing replication
+- **Database won't start** — check ownership of the postgres data directory
+  against the postgres container's user; a mismatched owner is the usual cause.
+- **Photos missing after a restore** — run a library re-scan (see above) so the
+  database and the files on disk are reconciled.
