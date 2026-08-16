@@ -51,6 +51,39 @@ First-run setup, in the web UI at `http://<server>:2283`:
 > PostgreSQL initializes with whatever password it sees on first start — if you
 > change it later you must reinitialize the postgres volume.
 
+### Upload volume on a network share
+
+If the upload library lives on a network share (NFS, or SMB/CIFS) rather than
+local disk, the server must be able to **write** to it. On startup Immich runs a
+folder-integrity check that writes a `.immich` marker into each upload
+subdirectory (`upload`, `library`, `thumbs`, `encoded-video`, `profile`,
+`backups`); if any write is denied it logs `EACCES: permission denied` and the
+microservices worker exits — i.e. the server **crash-loops**, never becoming
+healthy.
+
+The identity that must have write access depends on the protocol:
+
+- **NFS**: the container's process runs as root and typically writes as the
+  export's `anonuid`/`anongid` (or root, if not squashed). A root-writable export
+  "just works" — which is why a share can pass under NFS and then fail after a
+  cut to SMB.
+- **SMB/CIFS**: the write is performed by the share's **authenticated user** (the
+  mount's `username=`), and is permission-checked by the SMB server — the
+  container's uid is irrelevant. That user must have write on the share **and** on
+  the underlying files. A tree owned `nobody:users` mode `0775` requires the SMB
+  user to be a **member of the owning group** (`users`); a server-side `read list`
+  that names the user forces it read-only regardless of any `write list`.
+
+Verify write access before blaming Immich:
+
+```sh
+# From the host, into the actual upload path the container mounts
+touch /path/to/upload/encoded-video/.wtest && rm /path/to/upload/encoded-video/.wtest
+```
+
+If that fails, fix it on the file/share server, not in the compose — see the
+unraid plugin's `docs/smb-user-permissions.md` for the SMB-server side.
+
 ---
 
 ## Backup & restore
@@ -98,6 +131,11 @@ docker compose logs -f immich-postgres
 docker compose logs -f immich-machine-learning
 ```
 
+- **Server crash-loops with `EACCES` writing `<upload>/.../.immich`** — the
+  upload volume is not writable by the identity Immich writes as. This is common
+  after moving the library onto a network share, or cutting a share from NFS to
+  SMB. See [Upload volume on a network share](#upload-volume-on-a-network-share);
+  fix write access on the file/share server, then restart the server container.
 - **Database won't start** — check ownership of the postgres data directory
   against the postgres container's user; a mismatched owner is the usual cause.
 - **Photos missing after a restore** — run a library re-scan (see above) so the
