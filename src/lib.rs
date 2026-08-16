@@ -6,9 +6,11 @@
 //! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
+use plugin_toolkit::client::Client;
+use plugin_toolkit::contract::health::Health;
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
-    WorkloadSpec,
+    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceInfo,
+    ServiceStatus, StackContainer, WorkloadSpec,
 };
 
 /// immich backend. Holds only the provider name; per-instance endpoint/creds
@@ -78,12 +80,92 @@ impl ServiceBackend for ImmichBackend {
         Box::pin(async move { Err(ServiceError::unimplemented("immich.configure")) })
     }
 
+    /// Health via immich's own HTTP API, surfaced as a typed
+    /// [`ServiceInfo::ContainerStack`].
+    ///
+    /// The server runs a startup folder-integrity check that writes a `.immich`
+    /// marker into each upload subdirectory; if the upload volume is unwritable
+    /// that write fails with `EACCES` and the worker exits — the server
+    /// crash-loops and never answers `/api/server/ping`. So a passing ping is a
+    /// positive proxy that the upload mount is writable, and a server that is
+    /// unreachable-but-its-host-is-up is the signature of exactly that
+    /// unwritable-upload failure — which the `detail` calls out.
+    ///
+    /// Scope: this reads what the HTTP API truthfully exposes — the server
+    /// container's health and version. Per-container health for the postgres /
+    /// redis / machine-learning containers and a direct upload write-probe are
+    /// not reachable over the service `Endpoint` (they need a runtime/exec seam
+    /// the `ServiceBackend` does not own yet); they stay `Unknown` / empty until
+    /// that seam lands. The typed `ContainerStack` shape already has room for
+    /// them.
     fn status<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        ep: &'a Endpoint,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
-        // TODO: real health/diagnostics.
-        Box::pin(async move { Err(ServiceError::unimplemented("immich.status")) })
+        Box::pin(async move {
+            let base = ep.base_url.trim_end_matches('/');
+            if base.is_empty() {
+                return Err(ServiceError::Other(
+                    "immich.status: endpoint has no base_url".to_string(),
+                ));
+            }
+            let client = Client::new();
+
+            // Liveness — /api/server/ping returns {"res":"pong"} (no auth).
+            let pong = client
+                .get(format!("{base}/api/server/ping"))
+                .map(|r| r.is_success() && r.text().contains("pong"))
+                .unwrap_or(false);
+
+            // Best-effort version — /api/server/version → {major,minor,patch}.
+            let version = client
+                .get(format!("{base}/api/server/version"))
+                .ok()
+                .filter(|r| r.is_success())
+                .and_then(|r| r.json::<plugin_toolkit::serde_json::Value>().ok())
+                .and_then(|v| {
+                    Some(format!(
+                        "v{}.{}.{}",
+                        v.get("major")?.as_u64()?,
+                        v.get("minor")?.as_u64()?,
+                        v.get("patch")?.as_u64()?,
+                    ))
+                });
+
+            let server_health = if pong {
+                Health::Healthy
+            } else {
+                Health::Unhealthy
+            };
+
+            let detail = if pong {
+                match &version {
+                    Some(v) => format!("immich-server healthy ({v})"),
+                    None => "immich-server healthy".to_string(),
+                }
+            } else {
+                "immich-server not responding on /api/server/ping — if the host \
+                 is up, the server is likely crash-looping; the most common cause \
+                 is the upload volume being unwritable (EACCES on the .immich \
+                 folder check)"
+                    .to_string()
+            };
+
+            Ok(ServiceStatus {
+                healthy: pong,
+                detail,
+                info: ServiceInfo::ContainerStack {
+                    containers: vec![StackContainer {
+                        name: "immich-server".to_string(),
+                        state: if pong { "running" } else { "unknown" }.to_string(),
+                        health: server_health,
+                        restart_count: 0,
+                    }],
+                    mounts: Vec::new(),
+                    version,
+                },
+            })
+        })
     }
 }
 
