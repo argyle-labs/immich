@@ -4,3 +4,6 @@ Cargo.lock.orig
 
 # local-dev orca override (never commit)
 /.cargo/config.toml
+
+# transient git worktrees
+immich-worktrees/
