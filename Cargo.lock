@@ -843,6 +843,7 @@ name = "immich"
 version = "0.1.0"
 dependencies = [
  "orca-plugin-toolkit",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

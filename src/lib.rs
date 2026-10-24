@@ -2,7 +2,8 @@
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools drive immich,
 //! and exposes read tools over the Immich API (`immich.status`,
-//! `immich.assets.check`, `immich.assets.stats`, `immich.trash.list`).
+//! `immich.assets.check`, `immich.assets.stats`, `immich.trash.list`) and the admin
+//! `immich.assets.scan`.
 #![allow(clippy::disallowed_types)]
 
 pub mod api;

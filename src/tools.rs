@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use plugin_toolkit::prelude::*;
@@ -9,7 +10,7 @@ use crate::scan;
 const CHECK_BATCH: usize = 1000;
 const DEFAULT_HASH_CONCURRENCY: usize = 4;
 const DEFAULT_MAX_FILES: usize = 100_000;
-const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 3600;
+const MAX_SCAN_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_TRASH_LIMIT: usize = 10_000;
 
 #[endpoint_resource(plugin = "immich")]
@@ -18,7 +19,7 @@ pub struct ImmichEndpoint {
     /// Immich API key, sent as `x-api-key`.
     #[secret]
     pub api_key: String,
-    /// Colon-separated directories `assets.check --path` may read; unset disables `--path`.
+    /// Absolute directories `assets.scan` may read: a JSON array, or `:`-separated (paths containing `:` need the JSON form). Unset disables scanning.
     pub scan_roots: Option<String>,
     pub enabled: bool,
 }
@@ -186,16 +187,23 @@ pub struct AssetsCheckArgs {
     #[arg(long = "item", value_parser = parse_check_input, action = clap::ArgAction::Append)]
     #[serde(default)]
     pub items: Vec<CheckInput>,
-    /// Directory on this member to walk and hash (symlinks are not followed).
+}
+
+#[orca_struct(args)]
+pub struct AssetsScanArgs {
+    /// Registered immich endpoint name.
     #[arg(long)]
-    pub path: Option<String>,
+    pub name: String,
+    /// Directory on this member under one of the endpoint's `scan_roots`.
+    #[arg(long)]
+    pub path: String,
     /// Files hashed in parallel, 1-16. Default 4.
     #[arg(long)]
     pub concurrency: Option<usize>,
-    /// Maximum files taken from `--path`. Default 100000.
+    /// Maximum files walked, up to 1000000. Default 100000.
     #[arg(long)]
     pub max_files: Option<usize>,
-    /// Overall time budget in seconds. Default 3600.
+    /// Overall time budget in seconds, up to 3600. Default 3600.
     #[arg(long)]
     pub timeout_secs: Option<u64>,
 }
@@ -291,47 +299,82 @@ pub fn reject_duplicate_ids(inputs: &[CheckInput]) -> Result<()> {
     Ok(())
 }
 
-async fn run_check(args: AssetsCheckArgs) -> Result<AssetsCheckReport> {
+pub fn ensure_enabled(name: &str, enabled: bool) -> Result<()> {
+    if !enabled {
+        bail!("immich endpoint '{name}' is disabled");
+    }
+    Ok(())
+}
+
+/// Which items are already in Immich, by SHA1, flagging those only present in trash.
+#[orca_tool(domain = "immich", verb = "assets.check", role = "read")]
+async fn immich_assets_check(args: AssetsCheckArgs, _ctx: &ToolCtx) -> Result<AssetsCheckReport> {
+    if args.items.is_empty() {
+        bail!("pass at least one --item");
+    }
+    reject_duplicate_ids(&args.items)?;
+    check(&connect(&args.name).await?, &args.items).await
+}
+
+async fn run_scan(args: AssetsScanArgs, cancel: scan::Cancel) -> Result<AssetsCheckReport> {
     let row = endpoint_db::require(&args.name)?;
-    let mut inputs = args.items;
-    let mut failures = Vec::new();
-    let mut truncated = false;
-    if let Some(path) = args.path.as_deref() {
-        let roots = scan::parse_roots(row.scan_roots.as_deref().unwrap_or_default());
-        let root = scan::resolve_scan_root(Path::new(path), &roots).map_err(|e| anyhow!(e))?;
-        let max_files = args.max_files.unwrap_or(DEFAULT_MAX_FILES);
-        let walk = tokio::task::spawn_blocking(move || scan::walk_media(&root, max_files)).await?;
-        truncated = walk.truncated;
-        failures.extend(walk.failures.into_iter().map(|(p, error)| CheckFailure {
-            id: p.display().to_string(),
-            error,
-        }));
-        let concurrency = args.concurrency.unwrap_or(DEFAULT_HASH_CONCURRENCY);
-        for (path, hashed) in scan::hash_all(walk.files, concurrency).await {
-            let id = path.display().to_string();
-            match hashed {
-                Ok(sha1) => inputs.push(CheckInput { id, sha1 }),
-                Err(error) => failures.push(CheckFailure { id, error }),
-            }
+    ensure_enabled(&args.name, row.enabled)?;
+    let roots =
+        scan::parse_roots(row.scan_roots.as_deref().unwrap_or_default()).map_err(|e| anyhow!(e))?;
+    let root = scan::resolve_scan_root(Path::new(&args.path), &roots).map_err(|e| anyhow!(e))?;
+    let _lock = scan::ScanLock::acquire().ok_or_else(|| anyhow!("scan in progress"))?;
+    let root_fd = Arc::new(scan::open_root(&root).map_err(|_| anyhow!(scan::OUTSIDE_ROOTS))?);
+    let max_files = args
+        .max_files
+        .unwrap_or(DEFAULT_MAX_FILES)
+        .min(scan::MAX_FILES_CAP);
+    let (walk_fd, walk_cancel) = (root_fd.clone(), cancel.clone());
+    let walk = tokio::task::spawn_blocking(move || {
+        scan::walk_media(&walk_fd, max_files, scan::MAX_ENTRIES, &walk_cancel)
+    })
+    .await?;
+    if walk.cancelled {
+        bail!("scan cancelled");
+    }
+    let id_of = |rel: &Path| root.join(rel).display().to_string();
+    let mut failures: Vec<CheckFailure> = walk
+        .failures
+        .iter()
+        .map(|(p, error)| CheckFailure {
+            id: id_of(p),
+            error: error.clone(),
+        })
+        .collect();
+    let concurrency = args.concurrency.unwrap_or(DEFAULT_HASH_CONCURRENCY);
+    let mut inputs = Vec::new();
+    for (rel, hashed) in scan::hash_all(root_fd, walk.files, concurrency, cancel.clone()).await {
+        let id = id_of(&rel);
+        match hashed {
+            Ok(sha1) => inputs.push(CheckInput { id, sha1 }),
+            Err(error) => failures.push(CheckFailure { id, error }),
         }
     }
-    reject_duplicate_ids(&inputs)?;
-    if inputs.is_empty() && failures.is_empty() {
-        bail!("pass --item or --path");
+    if cancel.is_cancelled() {
+        bail!("scan cancelled");
     }
     let mut report = check(&connect(&args.name).await?, &inputs).await?;
     report.failures.extend(failures);
-    report.truncated = truncated;
+    report.truncated = walk.truncated;
     Ok(report)
 }
 
-/// Which files are already in Immich, by SHA1, flagging those only present in trash.
-#[orca_tool(domain = "immich", verb = "assets.check", role = "read")]
-async fn immich_assets_check(args: AssetsCheckArgs, _ctx: &ToolCtx) -> Result<AssetsCheckReport> {
-    let secs = args.timeout_secs.unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS);
-    tokio::time::timeout(Duration::from_secs(secs), run_check(args))
+/// Walk a member directory, hash media, and check which files are already in Immich.
+#[orca_tool(domain = "immich", verb = "assets.scan", role = "admin")]
+async fn immich_assets_scan(args: AssetsScanArgs, _ctx: &ToolCtx) -> Result<AssetsCheckReport> {
+    let cancel = scan::Cancel::default();
+    let _guard = scan::CancelOnDrop(cancel.clone());
+    let secs = args
+        .timeout_secs
+        .unwrap_or(MAX_SCAN_TIMEOUT_SECS)
+        .min(MAX_SCAN_TIMEOUT_SECS);
+    tokio::time::timeout(Duration::from_secs(secs), run_scan(args, cancel))
         .await
-        .map_err(|_| anyhow!("immich.assets.check exceeded {secs}s"))?
+        .map_err(|_| anyhow!("immich.assets.scan exceeded {secs}s"))?
 }
 
 #[cfg(test)]
@@ -373,6 +416,12 @@ mod tests {
         assert_eq!(report.present[1].asset_id, "asset-b");
         assert_eq!(report.missing[0].id, "c");
         assert_eq!(report.failures[0].id, "d");
+    }
+
+    #[test]
+    fn disabled_endpoint_rejected() {
+        assert!(ensure_enabled("x", true).is_ok());
+        assert!(ensure_enabled("x", false).is_err());
     }
 
     #[test]
