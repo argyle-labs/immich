@@ -1,10 +1,17 @@
 //! immich service backend — Self-hosted photo/video (multi-service).
 //!
-//! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive immich. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! Implements `ServiceBackend` so the generic `service.*` tools drive immich,
+//! and exposes read tools over the Immich API (`immich.status`,
+//! `immich.assets.check`, `immich.assets.stats`, `immich.trash.list`) and the admin
+//! `immich.assets.scan`.
 #![allow(clippy::disallowed_types)]
+
+pub mod api;
+pub mod scan;
+pub mod tools;
+
+#[cfg(test)]
+mod testing;
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
@@ -82,11 +89,27 @@ impl ServiceBackend for ImmichBackend {
 
     fn status<'a>(
         &'a self,
-        _instance: &'a str,
+        instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
-        // TODO: real health/diagnostics.
-        Box::pin(async move { Err(ServiceError::unimplemented("immich.status")) })
+        Box::pin(async move {
+            let report = match tools::connect(instance).await {
+                Ok(c) => tools::status_of(&c).await,
+                Err(e) => Err(e),
+            };
+            Ok(match report {
+                Ok(r) => ServiceStatus {
+                    healthy: r.reachable,
+                    detail: format!("immich {}", r.version),
+                    info: Default::default(),
+                },
+                Err(e) => ServiceStatus {
+                    healthy: false,
+                    detail: e.to_string(),
+                    info: Default::default(),
+                },
+            })
+        })
     }
 }
 

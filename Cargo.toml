@@ -16,14 +16,17 @@ crate-type = ["rlib"]
 name = "immich"
 path = "src/main.rs"
 
-# immich is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
-# ServiceBackend over the orca socket and reaches the whole orca system
-# through plugin-toolkit alone.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
+plugin-toolkit = { version = "=0.2.1-rc.39", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "delegated-http"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+sha1        = { version = "0.10", default-features = false }
+rustix      = { version = "1", default-features = false, features = ["fs", "std"] }
+tokio       = { version = "1", default-features = false, features = ["rt", "sync"] }
 
 [dev-dependencies]
-tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio    = { version = "1", features = ["macros", "rt"] }
 tempfile = "3"
 
 [lints.clippy]
