@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::Path;
+use std::time::Duration;
 
 use plugin_toolkit::prelude::*;
 
@@ -7,6 +8,9 @@ use crate::scan;
 
 const CHECK_BATCH: usize = 1000;
 const DEFAULT_HASH_CONCURRENCY: usize = 4;
+const DEFAULT_MAX_FILES: usize = 100_000;
+const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_TRASH_LIMIT: usize = 10_000;
 
 #[endpoint_resource(plugin = "immich")]
 pub struct ImmichEndpoint {
@@ -14,6 +18,8 @@ pub struct ImmichEndpoint {
     /// Immich API key, sent as `x-api-key`.
     #[secret]
     pub api_key: String,
+    /// Colon-separated directories `assets.check --path` may read; unset disables `--path`.
+    pub scan_roots: Option<String>,
     pub enabled: bool,
 }
 
@@ -42,7 +48,6 @@ pub struct StatusReport {
     pub photos: Option<u64>,
     pub videos: Option<u64>,
     pub usage_bytes: Option<u64>,
-    /// Set when `/api/server/statistics` fails; it requires an admin API key.
     pub statistics_error: Option<String>,
 }
 
@@ -102,9 +107,9 @@ pub struct TrashedAsset {
     pub id: String,
     pub original_file_name: String,
     pub original_path: Option<String>,
+    pub owner_id: Option<String>,
     /// Base64 SHA1, as Immich reports it.
     pub checksum: String,
-    /// Immich exposes no `deletedAt`; `updatedAt` is bumped when an asset is trashed.
     pub updated_at: Option<String>,
 }
 
@@ -112,27 +117,39 @@ pub struct TrashedAsset {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrashList {
     pub count: usize,
+    pub truncated: bool,
     pub assets: Vec<TrashedAsset>,
 }
 
-/// Trashed assets owned by the API key's user.
+#[orca_struct(args)]
+pub struct TrashListArgs {
+    /// Registered immich endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Maximum assets returned. Default 10000.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+/// Trashed assets visible to the API key's user (excludes locked-folder assets).
 #[orca_tool(domain = "immich", verb = "trash.list", role = "read")]
-async fn immich_trash_list(args: EndpointArgs, _ctx: &ToolCtx) -> Result<TrashList> {
-    let assets: Vec<TrashedAsset> = connect(&args.name)
-        .await?
-        .trashed_assets()
-        .await?
+async fn immich_trash_list(args: TrashListArgs, _ctx: &ToolCtx) -> Result<TrashList> {
+    let limit = args.limit.unwrap_or(DEFAULT_TRASH_LIMIT);
+    let (raw, truncated) = connect(&args.name).await?.trashed_assets(limit).await?;
+    let assets: Vec<TrashedAsset> = raw
         .into_iter()
         .map(|a| TrashedAsset {
             id: a.id,
             original_file_name: a.original_file_name,
             original_path: a.original_path,
+            owner_id: a.owner_id,
             checksum: a.checksum,
             updated_at: a.updated_at,
         })
         .collect();
     Ok(TrashList {
         count: assets.len(),
+        truncated,
         assets,
     })
 }
@@ -172,9 +189,15 @@ pub struct AssetsCheckArgs {
     /// Directory on this member to walk and hash (symlinks are not followed).
     #[arg(long)]
     pub path: Option<String>,
-    /// Files hashed in parallel. Default 4.
+    /// Files hashed in parallel, 1-16. Default 4.
     #[arg(long)]
     pub concurrency: Option<usize>,
+    /// Maximum files taken from `--path`. Default 100000.
+    #[arg(long)]
+    pub max_files: Option<usize>,
+    /// Overall time budget in seconds. Default 3600.
+    #[arg(long)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[orca_struct]
@@ -200,6 +223,7 @@ pub struct AssetsCheckReport {
     pub present_count: usize,
     pub trashed_count: usize,
     pub missing_count: usize,
+    pub truncated: bool,
     pub present: Vec<PresentAsset>,
     pub missing: Vec<CheckInput>,
     pub failures: Vec<CheckFailure>,
@@ -235,6 +259,7 @@ pub fn classify(inputs: &[CheckInput], results: Vec<CheckResult>) -> AssetsCheck
         present_count: present.len(),
         trashed_count: present.iter().filter(|p| p.trashed).count(),
         missing_count: missing.len(),
+        truncated: false,
         present,
         missing,
         failures,
@@ -256,32 +281,57 @@ pub async fn check(c: &Immich, inputs: &[CheckInput]) -> Result<AssetsCheckRepor
     Ok(classify(inputs, results))
 }
 
-/// Which files are already in Immich, by SHA1, flagging those only present in trash.
-#[orca_tool(domain = "immich", verb = "assets.check", role = "read")]
-async fn immich_assets_check(args: AssetsCheckArgs, _ctx: &ToolCtx) -> Result<AssetsCheckReport> {
+pub fn reject_duplicate_ids(inputs: &[CheckInput]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for i in inputs {
+        if !seen.insert(i.id.as_str()) {
+            bail!("duplicate item id '{}'", i.id);
+        }
+    }
+    Ok(())
+}
+
+async fn run_check(args: AssetsCheckArgs) -> Result<AssetsCheckReport> {
+    let row = endpoint_db::require(&args.name)?;
     let mut inputs = args.items;
-    let mut hash_failures = Vec::new();
-    if let Some(root) = args.path.as_deref() {
-        let root = PathBuf::from(root);
-        let files = scan::walk_media(&root).with_context(|| format!("walk {}", root.display()))?;
+    let mut failures = Vec::new();
+    let mut truncated = false;
+    if let Some(path) = args.path.as_deref() {
+        let roots = scan::parse_roots(row.scan_roots.as_deref().unwrap_or_default());
+        let root = scan::resolve_scan_root(Path::new(path), &roots).map_err(|e| anyhow!(e))?;
+        let max_files = args.max_files.unwrap_or(DEFAULT_MAX_FILES);
+        let walk = tokio::task::spawn_blocking(move || scan::walk_media(&root, max_files)).await?;
+        truncated = walk.truncated;
+        failures.extend(walk.failures.into_iter().map(|(p, error)| CheckFailure {
+            id: p.display().to_string(),
+            error,
+        }));
         let concurrency = args.concurrency.unwrap_or(DEFAULT_HASH_CONCURRENCY);
-        for (path, hashed) in scan::hash_all(files, concurrency).await {
+        for (path, hashed) in scan::hash_all(walk.files, concurrency).await {
             let id = path.display().to_string();
             match hashed {
                 Ok(sha1) => inputs.push(CheckInput { id, sha1 }),
-                Err(e) => hash_failures.push(CheckFailure {
-                    id,
-                    error: e.to_string(),
-                }),
+                Err(error) => failures.push(CheckFailure { id, error }),
             }
         }
     }
-    if inputs.is_empty() && hash_failures.is_empty() {
+    reject_duplicate_ids(&inputs)?;
+    if inputs.is_empty() && failures.is_empty() {
         bail!("pass --item or --path");
     }
     let mut report = check(&connect(&args.name).await?, &inputs).await?;
-    report.failures.extend(hash_failures);
+    report.failures.extend(failures);
+    report.truncated = truncated;
     Ok(report)
+}
+
+/// Which files are already in Immich, by SHA1, flagging those only present in trash.
+#[orca_tool(domain = "immich", verb = "assets.check", role = "read")]
+async fn immich_assets_check(args: AssetsCheckArgs, _ctx: &ToolCtx) -> Result<AssetsCheckReport> {
+    let secs = args.timeout_secs.unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS);
+    tokio::time::timeout(Duration::from_secs(secs), run_check(args))
+        .await
+        .map_err(|_| anyhow!("immich.assets.check exceeded {secs}s"))?
 }
 
 #[cfg(test)]
@@ -323,6 +373,43 @@ mod tests {
         assert_eq!(report.present[1].asset_id, "asset-b");
         assert_eq!(report.missing[0].id, "c");
         assert_eq!(report.failures[0].id, "d");
+    }
+
+    #[test]
+    fn duplicate_ids_rejected() {
+        assert!(reject_duplicate_ids(&[input("a"), input("b")]).is_ok());
+        assert!(reject_duplicate_ids(&[input("a"), input("a")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn status_survives_failing_statistics() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/server/ping"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"res": "pong"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/server/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"major": 3, "minor": 3, "patch": 5, "prerelease": null}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/server/statistics"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let r = status_of(&Immich::new(&server.uri(), "k")).await.unwrap();
+        assert!(r.reachable);
+        assert_eq!(r.version, "3.3.5");
+        assert_eq!(r.photos, None);
+        assert!(r.statistics_error.is_some());
     }
 
     #[test]

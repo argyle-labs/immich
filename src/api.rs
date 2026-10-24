@@ -98,6 +98,8 @@ pub struct Asset {
     pub original_file_name: String,
     #[serde(default)]
     pub original_path: Option<String>,
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub checksum: String,
     #[serde(default)]
     pub is_trashed: bool,
@@ -129,6 +131,7 @@ struct SearchAssets {
 }
 
 const TRASH_PAGE_SIZE: u32 = 1000;
+pub const TRASH_MAX_PAGES: u32 = 100;
 
 impl Immich {
     pub fn new(base_url: &str, api_key: &str) -> Self {
@@ -199,7 +202,7 @@ impl Immich {
         Ok(resp.results)
     }
 
-    pub async fn trashed_assets(&self) -> Result<Vec<Asset>, ImmichError> {
+    pub async fn trashed_assets(&self, limit: usize) -> Result<(Vec<Asset>, bool), ImmichError> {
         let mut out = Vec::new();
         let mut page = 1;
         loop {
@@ -211,12 +214,19 @@ impl Immich {
             };
             let resp: SearchResponse = self.post("/api/search/metadata", &body).await?;
             out.extend(resp.assets.items.into_iter().filter(|a| a.is_trashed));
-            match resp.assets.next_page.and_then(|p| p.parse().ok()) {
-                Some(next) if next > page => page = next,
+            let next = resp.assets.next_page.and_then(|p| p.parse::<u32>().ok());
+            if out.len() >= limit {
+                let more = out.len() > limit || next.is_some();
+                out.truncate(limit);
+                return Ok((out, more));
+            }
+            match next {
+                Some(n) if n > page && n <= TRASH_MAX_PAGES => page = n,
+                Some(n) if n > page => return Ok((out, true)),
                 _ => break,
             }
         }
-        Ok(out)
+        Ok((out, false))
     }
 }
 
@@ -283,6 +293,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/assets/bulk-upload-check"))
+            .and(header("x-api-key", "k"))
             .and(body_json(
                 json!({"assets": [{"id": "a.jpg", "checksum": "ab"}]}),
             ))
@@ -329,13 +340,37 @@ mod tests {
             .mount(&server)
             .await;
         let ids: Vec<String> = Immich::new(&server.uri(), "k")
-            .trashed_assets()
+            .trashed_assets(10)
             .await
             .unwrap()
+            .0
             .into_iter()
             .map(|a| a.id)
             .collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn trashed_assets_respects_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/search/metadata"))
+            .and(header("x-api-key", "k"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"assets": {
+                "items": [
+                    {"id": "a", "originalFileName": "a", "checksum": "c", "isTrashed": true},
+                    {"id": "b", "originalFileName": "b", "checksum": "c", "isTrashed": true}
+                ], "nextPage": "2"
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (assets, truncated) = Immich::new(&server.uri(), "k")
+            .trashed_assets(1)
+            .await
+            .unwrap();
+        assert_eq!(assets.len(), 1);
+        assert!(truncated);
     }
 
     #[tokio::test]

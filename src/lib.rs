@@ -1,9 +1,8 @@
 //! immich service backend — Self-hosted photo/video (multi-service).
 //!
-//! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive immich. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! Implements `ServiceBackend` so the generic `service.*` tools drive immich,
+//! and exposes read tools over the Immich API (`immich.status`,
+//! `immich.assets.check`, `immich.assets.stats`, `immich.trash.list`).
 #![allow(clippy::disallowed_types)]
 
 pub mod api;
