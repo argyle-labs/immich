@@ -113,7 +113,23 @@ fn lexically_under(path: &Path, roots: &[PathBuf]) -> bool {
         && roots.iter().any(|r| path.starts_with(r))
 }
 
-pub fn resolve_scan_root(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanTarget {
+    pub root: PathBuf,
+    pub rel: PathBuf,
+}
+
+impl ScanTarget {
+    pub fn path(&self) -> PathBuf {
+        self.root.join(&self.rel)
+    }
+
+    pub fn open(&self) -> std::io::Result<OwnedFd> {
+        open_dir_beneath(&open_root(&self.root)?, &self.rel)
+    }
+}
+
+pub fn resolve_scan_root(path: &Path, roots: &[PathBuf]) -> Result<ScanTarget, String> {
     if roots.is_empty() {
         return Err("endpoint has no scan_roots; scanning is disabled".into());
     }
@@ -121,11 +137,19 @@ pub fn resolve_scan_root(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, Stri
         return Err(OUTSIDE_ROOTS.into());
     }
     let canon = path.canonicalize().map_err(|_| OUTSIDE_ROOTS.to_string())?;
-    if roots.iter().any(|r| canon.starts_with(r)) {
-        Ok(canon)
-    } else {
-        Err(OUTSIDE_ROOTS.into())
+    if !roots.iter().any(|r| canon.starts_with(r)) {
+        return Err(OUTSIDE_ROOTS.into());
     }
+    roots
+        .iter()
+        .filter_map(|r| {
+            path.strip_prefix(r).ok().map(|rel| ScanTarget {
+                root: r.clone(),
+                rel: rel.to_path_buf(),
+            })
+        })
+        .max_by_key(|t| t.root.components().count())
+        .ok_or_else(|| OUTSIDE_ROOTS.into())
 }
 
 pub fn open_root(root: &Path) -> std::io::Result<OwnedFd> {
@@ -271,6 +295,7 @@ pub async fn hash_all(
     paths: Vec<PathBuf>,
     concurrency: usize,
     cancel: Cancel,
+    lock: Arc<ScanLock>,
 ) -> Vec<(PathBuf, Result<String, String>)> {
     let permits = Arc::new(Semaphore::new(clamp_concurrency(concurrency)));
     let mut set = JoinSet::new();
@@ -282,8 +307,10 @@ pub async fn hash_all(
         let Ok(permit) = permits.clone().acquire_owned().await else {
             break;
         };
-        let (task_path, root, cancel) = (path.clone(), root.clone(), cancel.clone());
+        let (task_path, root, cancel, lock) =
+            (path.clone(), root.clone(), cancel.clone(), lock.clone());
         let handle = set.spawn_blocking(move || {
+            let _lock = lock;
             let r = open_file_beneath(&root, &task_path)
                 .and_then(|f| sha1_reader(f, &cancel))
                 .map_err(|e| e.kind().to_string());
@@ -332,10 +359,21 @@ mod tests {
     }
 
     #[test]
-    fn scan_lock_is_exclusive() {
+    fn scan_lock_held_until_last_task_exits() {
         let first = ScanLock::acquire().unwrap();
         assert!(ScanLock::acquire().is_none());
         drop(first);
+        let lock = Arc::new(ScanLock::acquire().unwrap());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let held = lock.clone();
+        let task = std::thread::spawn(move || {
+            let _held = held;
+            wait.recv().unwrap();
+        });
+        drop(lock);
+        assert!(ScanLock::acquire().is_none());
+        release.send(()).unwrap();
+        task.join().unwrap();
         assert!(ScanLock::acquire().is_some());
     }
 
@@ -369,7 +407,9 @@ mod tests {
         std::fs::create_dir(croot.join("sub")).unwrap();
         let roots = vec![croot.clone()];
         assert_eq!(
-            resolve_scan_root(&croot.join("sub"), &roots).unwrap(),
+            resolve_scan_root(&croot.join("sub"), &roots)
+                .unwrap()
+                .path(),
             croot.join("sub")
         );
         for bad in [
@@ -394,6 +434,22 @@ mod tests {
             resolve_scan_root(&croot.join("out"), std::slice::from_ref(&croot)).unwrap_err(),
             OUTSIDE_ROOTS
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_open_refuses_intermediate_symlink_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let croot = root.path().canonicalize().unwrap();
+        std::fs::create_dir_all(croot.join("a/b")).unwrap();
+        let target = resolve_scan_root(&croot.join("a/b"), std::slice::from_ref(&croot)).unwrap();
+        assert_eq!(target.rel, PathBuf::from("a/b"));
+        assert!(target.open().is_ok());
+        std::fs::remove_dir_all(croot.join("a")).unwrap();
+        std::fs::create_dir(outside.path().join("b")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), croot.join("a")).unwrap();
+        assert!(target.open().is_err());
     }
 
     #[cfg(unix)]
@@ -498,7 +554,8 @@ mod tests {
         std::fs::write(dir.path().join("b.jpg"), b"").unwrap();
         let fd = Arc::new(root_fd(dir.path()));
         let paths = vec!["b.jpg".into(), "a.jpg".into(), "gone.jpg".into()];
-        let got = hash_all(fd, paths, 2, Cancel::default()).await;
+        let lock = Arc::new(ScanLock(()));
+        let got = hash_all(fd, paths, 2, Cancel::default(), lock).await;
         assert_eq!(got[0].0, PathBuf::from("a.jpg"));
         assert_eq!(
             got[0].1.as_ref().unwrap(),

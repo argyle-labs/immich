@@ -321,15 +321,17 @@ async fn run_scan(args: AssetsScanArgs, cancel: scan::Cancel) -> Result<AssetsCh
     ensure_enabled(&args.name, row.enabled)?;
     let roots =
         scan::parse_roots(row.scan_roots.as_deref().unwrap_or_default()).map_err(|e| anyhow!(e))?;
-    let root = scan::resolve_scan_root(Path::new(&args.path), &roots).map_err(|e| anyhow!(e))?;
-    let _lock = scan::ScanLock::acquire().ok_or_else(|| anyhow!("scan in progress"))?;
-    let root_fd = Arc::new(scan::open_root(&root).map_err(|_| anyhow!(scan::OUTSIDE_ROOTS))?);
+    let target = scan::resolve_scan_root(Path::new(&args.path), &roots).map_err(|e| anyhow!(e))?;
+    let lock = Arc::new(scan::ScanLock::acquire().ok_or_else(|| anyhow!("scan in progress"))?);
+    let root_fd = Arc::new(target.open().map_err(|_| anyhow!(scan::OUTSIDE_ROOTS))?);
+    let root = target.path();
     let max_files = args
         .max_files
         .unwrap_or(DEFAULT_MAX_FILES)
         .min(scan::MAX_FILES_CAP);
-    let (walk_fd, walk_cancel) = (root_fd.clone(), cancel.clone());
+    let (walk_fd, walk_cancel, walk_lock) = (root_fd.clone(), cancel.clone(), lock.clone());
     let walk = tokio::task::spawn_blocking(move || {
+        let _lock = walk_lock;
         scan::walk_media(&walk_fd, max_files, scan::MAX_ENTRIES, &walk_cancel)
     })
     .await?;
@@ -347,7 +349,9 @@ async fn run_scan(args: AssetsScanArgs, cancel: scan::Cancel) -> Result<AssetsCh
         .collect();
     let concurrency = args.concurrency.unwrap_or(DEFAULT_HASH_CONCURRENCY);
     let mut inputs = Vec::new();
-    for (rel, hashed) in scan::hash_all(root_fd, walk.files, concurrency, cancel.clone()).await {
+    for (rel, hashed) in
+        scan::hash_all(root_fd, walk.files, concurrency, cancel.clone(), lock).await
+    {
         let id = id_of(&rel);
         match hashed {
             Ok(sha1) => inputs.push(CheckInput { id, sha1 }),
