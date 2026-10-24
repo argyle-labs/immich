@@ -6,6 +6,10 @@
 //! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
+pub mod api;
+pub mod scan;
+pub mod tools;
+
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
@@ -82,11 +86,27 @@ impl ServiceBackend for ImmichBackend {
 
     fn status<'a>(
         &'a self,
-        _instance: &'a str,
+        instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
-        // TODO: real health/diagnostics.
-        Box::pin(async move { Err(ServiceError::unimplemented("immich.status")) })
+        Box::pin(async move {
+            let report = match tools::connect(instance).await {
+                Ok(c) => tools::status_of(&c).await,
+                Err(e) => Err(e),
+            };
+            Ok(match report {
+                Ok(r) => ServiceStatus {
+                    healthy: r.reachable,
+                    detail: format!("immich {}", r.version),
+                    info: Default::default(),
+                },
+                Err(e) => ServiceStatus {
+                    healthy: false,
+                    detail: e.to_string(),
+                    info: Default::default(),
+                },
+            })
+        })
     }
 }
 
