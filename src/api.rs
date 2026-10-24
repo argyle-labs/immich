@@ -1,4 +1,5 @@
-use plugin_toolkit::http::{Client as HttpClient, HttpError};
+use plugin_toolkit::reqwest::header::HeaderValue;
+use plugin_toolkit::reqwest::{Client as HttpClient, RequestBuilder};
 use plugin_toolkit::serde::de::DeserializeOwned;
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::thiserror::Error;
@@ -6,7 +7,11 @@ use plugin_toolkit::thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ImmichError {
     #[error("immich http: {0}")]
-    Http(#[from] HttpError),
+    Http(String),
+    #[error("immich http {status}")]
+    Status { status: u16 },
+    #[error("immich decode: {0}")]
+    Decode(String),
 }
 
 #[derive(Clone)]
@@ -131,6 +136,7 @@ struct SearchAssets {
 }
 
 const TRASH_PAGE_SIZE: u32 = 1000;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub const TRASH_MAX_PAGES: u32 = 100;
 
 impl Immich {
@@ -146,14 +152,32 @@ impl Immich {
         format!("{}{path}", self.base_url)
     }
 
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ImmichError> {
-        let resp = self
-            .http
-            .get(self.url(path))
-            .header("x-api-key", &self.api_key)
+    async fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T, ImmichError> {
+        let mut key = HeaderValue::from_str(&self.api_key)
+            .map_err(|_| ImmichError::Http("invalid api key".into()))?;
+        key.set_sensitive(true);
+        let resp = req
+            .header("x-api-key", key)
+            .header("accept", HeaderValue::from_static("application/json"))
+            .timeout(REQUEST_TIMEOUT)
             .send()
-            .await?;
-        Ok(resp.json()?)
+            .await
+            .map_err(|e| ImmichError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ImmichError::Status {
+                status: status.as_u16(),
+            });
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| ImmichError::Http(e.to_string()))?;
+        serde_json::from_slice(&body).map_err(|e| ImmichError::Decode(e.to_string()))
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ImmichError> {
+        self.send(self.http.get(self.url(path))).await
     }
 
     async fn post<B: Serialize, T: DeserializeOwned>(
@@ -161,15 +185,7 @@ impl Immich {
         path: &str,
         body: &B,
     ) -> Result<T, ImmichError> {
-        let resp = self
-            .http
-            .post(self.url(path))
-            .header("x-api-key", &self.api_key)
-            .json(body)
-            .retry(true)
-            .send()
-            .await?;
-        Ok(resp.json()?)
+        self.send(self.http.post(self.url(path)).json(body)).await
     }
 
     pub async fn ping(&self) -> Result<Ping, ImmichError> {
@@ -233,154 +249,130 @@ impl Immich {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_toolkit::serde_json::json;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use crate::testing::{block, serve, Reply};
+    use serde_json::json;
 
-    #[tokio::test]
-    async fn server_endpoints_parse_and_send_key() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/ping"))
-            .and(header("x-api-key", "k"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"res": "pong"})))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/version"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"major": 2, "minor": 1, "patch": 0, "prerelease": null})),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/statistics"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "photos": 10, "videos": 2, "usage": 300, "usagePhotos": 200,
-                "usageVideos": 100, "usageByUser": []
-            })))
-            .mount(&server)
-            .await;
-        let c = Immich::new(&format!("{}/", server.uri()), "k");
-        assert_eq!(c.ping().await.unwrap().res, "pong");
-        assert_eq!(c.version().await.unwrap().semver(), "2.1.0");
-        let s = c.server_statistics().await.unwrap();
-        assert_eq!((s.photos, s.videos, s.usage_videos), (10, 2, 100));
+    const BASE: &str = "http://immich.test";
+
+    #[test]
+    fn server_endpoints_parse_and_send_key() {
+        let calls = serve(
+            |_, path, _| match path {
+                "/api/server/ping" => Reply::ok(json!({"res": "pong"})),
+                "/api/server/version" => {
+                    Reply::ok(json!({"major": 2, "minor": 1, "patch": 0, "prerelease": null}))
+                }
+                "/api/server/statistics" => Reply::ok(json!({
+                    "photos": 10, "videos": 2, "usage": 300, "usagePhotos": 200,
+                    "usageVideos": 100, "usageByUser": []
+                })),
+                _ => Reply::status(404),
+            },
+            || {
+                let c = Immich::new(&format!("{BASE}/"), "k");
+                assert_eq!(block(c.ping()).unwrap().res, "pong");
+                assert_eq!(block(c.version()).unwrap().semver(), "2.1.0");
+                let s = block(c.server_statistics()).unwrap();
+                assert_eq!((s.photos, s.videos, s.usage_videos), (10, 2, 100));
+            },
+        );
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|c| c.api_key.as_deref() == Some("k")));
     }
 
-    #[tokio::test]
-    async fn asset_statistics_passes_trash_filter() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/assets/statistics"))
-            .and(query_param("isTrashed", "true"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"images": 3, "videos": 1, "total": 4})),
-            )
-            .mount(&server)
-            .await;
-        let s = Immich::new(&server.uri(), "k")
-            .asset_statistics(true)
-            .await
-            .unwrap();
-        assert_eq!(s.total, 4);
+    #[test]
+    fn asset_statistics_passes_trash_filter() {
+        let calls = serve(
+            |_, _, _| Reply::ok(json!({"images": 3, "videos": 1, "total": 4})),
+            || {
+                let s = block(Immich::new(BASE, "k").asset_statistics(true)).unwrap();
+                assert_eq!(s.total, 4);
+            },
+        );
+        assert_eq!(calls[0].path, "/api/assets/statistics?isTrashed=true");
     }
 
-    #[tokio::test]
-    async fn bulk_upload_check_round_trips() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/assets/bulk-upload-check"))
-            .and(header("x-api-key", "k"))
-            .and(body_json(
-                json!({"assets": [{"id": "a.jpg", "checksum": "ab"}]}),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [
-                {"id": "a.jpg", "action": "reject", "reason": "duplicate",
-                 "assetId": "u1", "isTrashed": true}
-            ]})))
-            .mount(&server)
-            .await;
-        let r = Immich::new(&server.uri(), "k")
-            .bulk_upload_check(&[CheckItem {
-                id: "a.jpg".into(),
-                checksum: "ab".into(),
-            }])
-            .await
-            .unwrap();
-        assert_eq!(r[0].asset_id.as_deref(), Some("u1"));
-        assert_eq!(r[0].is_trashed, Some(true));
+    #[test]
+    fn bulk_upload_check_round_trips_with_key() {
+        let calls = serve(
+            |_, _, _| {
+                Reply::ok(json!({"results": [
+                    {"id": "a.jpg", "action": "reject", "reason": "duplicate",
+                     "assetId": "u1", "isTrashed": true}
+                ]}))
+            },
+            || {
+                let r = block(Immich::new(BASE, "k").bulk_upload_check(&[CheckItem {
+                    id: "a.jpg".into(),
+                    checksum: "ab".into(),
+                }]))
+                .unwrap();
+                assert_eq!(r[0].asset_id.as_deref(), Some("u1"));
+                assert_eq!(r[0].is_trashed, Some(true));
+            },
+        );
+        assert_eq!(calls[0].method, "POST");
+        assert_eq!(calls[0].path, "/api/assets/bulk-upload-check");
+        assert_eq!(calls[0].api_key.as_deref(), Some("k"));
+        assert_eq!(
+            calls[0].body,
+            json!({"assets": [{"id": "a.jpg", "checksum": "ab"}]})
+        );
     }
 
-    #[tokio::test]
-    async fn trashed_assets_follows_pages() {
-        let server = MockServer::start().await;
-        let asset = |id: &str, trashed: bool| {
-            json!({"id": id, "originalFileName": format!("{id}.jpg"), "checksum": "c",
-                   "isTrashed": trashed, "updatedAt": "2026-01-01T00:00:00.000Z"})
-        };
-        Mock::given(method("POST"))
-            .and(path("/api/search/metadata"))
-            .and(body_json(json!({"withDeleted": true,
-                "trashedAfter": "1970-01-01T00:00:00.000Z", "page": 1, "size": 1000})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"assets": {
-                "items": [asset("a", true), asset("b", false)], "nextPage": "2"
-            }})))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/search/metadata"))
-            .and(body_json(json!({"withDeleted": true,
-                "trashedAfter": "1970-01-01T00:00:00.000Z", "page": 2, "size": 1000})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"assets": {
-                "items": [asset("c", true)], "nextPage": null
-            }})))
-            .mount(&server)
-            .await;
-        let ids: Vec<String> = Immich::new(&server.uri(), "k")
-            .trashed_assets(10)
-            .await
-            .unwrap()
-            .0
-            .into_iter()
-            .map(|a| a.id)
-            .collect();
-        assert_eq!(ids, ["a", "c"]);
+    fn asset(id: &str, trashed: bool) -> serde_json::Value {
+        json!({"id": id, "originalFileName": format!("{id}.jpg"), "checksum": "c",
+               "isTrashed": trashed, "updatedAt": "2026-01-01T00:00:00.000Z"})
     }
 
-    #[tokio::test]
-    async fn trashed_assets_respects_limit() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/search/metadata"))
-            .and(header("x-api-key", "k"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"assets": {
-                "items": [
-                    {"id": "a", "originalFileName": "a", "checksum": "c", "isTrashed": true},
-                    {"id": "b", "originalFileName": "b", "checksum": "c", "isTrashed": true}
-                ], "nextPage": "2"
-            }})))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let (assets, truncated) = Immich::new(&server.uri(), "k")
-            .trashed_assets(1)
-            .await
-            .unwrap();
-        assert_eq!(assets.len(), 1);
-        assert!(truncated);
+    #[test]
+    fn trashed_assets_follows_pages() {
+        let calls = serve(
+            |_, _, body| match body["page"].as_u64() {
+                Some(1) => Reply::ok(json!({"assets": {
+                    "items": [asset("a", true), asset("b", false)], "nextPage": "2"}})),
+                _ => Reply::ok(json!({"assets": {"items": [asset("c", true)], "nextPage": null}})),
+            },
+            || {
+                let (assets, truncated) = block(Immich::new(BASE, "k").trashed_assets(10)).unwrap();
+                let ids: Vec<String> = assets.into_iter().map(|a| a.id).collect();
+                assert_eq!(ids, ["a", "c"]);
+                assert!(!truncated);
+            },
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].api_key.as_deref(), Some("k"));
+        assert_eq!(
+            calls[0].body,
+            json!({"withDeleted": true, "trashedAfter": "1970-01-01T00:00:00.000Z",
+                   "page": 1, "size": 1000})
+        );
     }
 
-    #[tokio::test]
-    async fn status_error_surfaces() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/ping"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server)
-            .await;
-        assert!(Immich::new(&server.uri(), "k").ping().await.is_err());
+    #[test]
+    fn trashed_assets_respects_limit() {
+        let calls = serve(
+            |_, _, _| {
+                Reply::ok(json!({"assets": {
+                    "items": [asset("a", true), asset("b", true)], "nextPage": "2"}}))
+            },
+            || {
+                let (assets, truncated) = block(Immich::new(BASE, "k").trashed_assets(1)).unwrap();
+                assert_eq!(assets.len(), 1);
+                assert!(truncated);
+            },
+        );
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn status_error_surfaces() {
+        serve(
+            |_, _, _| Reply::status(401),
+            || {
+                let e = block(Immich::new(BASE, "k").ping()).unwrap_err();
+                assert!(matches!(e, ImmichError::Status { status: 401 }));
+            },
+        );
     }
 }

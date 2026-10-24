@@ -10,6 +10,9 @@ pub mod api;
 pub mod scan;
 pub mod tools;
 
+#[cfg(test)]
+mod testing;
+
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,

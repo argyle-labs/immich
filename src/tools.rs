@@ -376,9 +376,9 @@ async fn immich_assets_scan(args: AssetsScanArgs, _ctx: &ToolCtx) -> Result<Asse
         .timeout_secs
         .unwrap_or(MAX_SCAN_TIMEOUT_SECS)
         .min(MAX_SCAN_TIMEOUT_SECS);
-    tokio::time::timeout(Duration::from_secs(secs), run_scan(args, cancel))
+    plugin_toolkit::time::timeout(Duration::from_secs(secs), run_scan(args, cancel))
         .await
-        .map_err(|_| anyhow!("immich.assets.scan exceeded {secs}s"))?
+        .ok_or_else(|| anyhow!("immich.assets.scan exceeded {secs}s"))?
 }
 
 #[cfg(test)]
@@ -434,35 +434,25 @@ mod tests {
         assert!(reject_duplicate_ids(&[input("a"), input("a")]).is_err());
     }
 
-    #[tokio::test]
-    async fn status_survives_failing_statistics() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/ping"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"res": "pong"})),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/version"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"major": 3, "minor": 3, "patch": 5, "prerelease": null}),
-            ))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/server/statistics"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-        let r = status_of(&Immich::new(&server.uri(), "k")).await.unwrap();
-        assert!(r.reachable);
-        assert_eq!(r.version, "3.3.5");
-        assert_eq!(r.photos, None);
-        assert!(r.statistics_error.is_some());
+    #[test]
+    fn status_survives_failing_statistics() {
+        use crate::testing::{block, serve, Reply};
+        serve(
+            |_, path, _| match path {
+                "/api/server/ping" => Reply::ok(serde_json::json!({"res": "pong"})),
+                "/api/server/version" => Reply::ok(
+                    serde_json::json!({"major": 3, "minor": 3, "patch": 5, "prerelease": null}),
+                ),
+                _ => Reply::status(403),
+            },
+            || {
+                let r = block(status_of(&Immich::new("http://immich.test", "k"))).unwrap();
+                assert!(r.reachable);
+                assert_eq!(r.version, "3.3.5");
+                assert_eq!(r.photos, None);
+                assert!(r.statistics_error.is_some());
+            },
+        );
     }
 
     #[test]
@@ -475,32 +465,28 @@ mod tests {
         assert!(parse_check_input("nope").is_err());
     }
 
-    #[tokio::test]
-    async fn check_batches_requests() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/assets/bulk-upload-check"))
-            .respond_with(|req: &Request| {
-                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    #[test]
+    fn check_batches_requests() {
+        use crate::testing::{block, serve, Reply};
+        let calls = serve(
+            |_, _, body| {
                 let results: Vec<serde_json::Value> = body["assets"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|a| serde_json::json!({"id": a["id"], "action": "accept"}))
                     .collect();
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": results}))
-            })
-            .expect(2)
-            .mount(&server)
-            .await;
-        let inputs: Vec<CheckInput> = (0..CHECK_BATCH + 1)
-            .map(|i| input(&i.to_string()))
-            .collect();
-        let report = check(&Immich::new(&server.uri(), "k"), &inputs)
-            .await
-            .unwrap();
-        assert_eq!(report.missing_count, CHECK_BATCH + 1);
+                Reply::ok(serde_json::json!({"results": results}))
+            },
+            || {
+                let inputs: Vec<CheckInput> = (0..CHECK_BATCH + 1)
+                    .map(|i| input(&i.to_string()))
+                    .collect();
+                let report =
+                    block(check(&Immich::new("http://immich.test", "k"), &inputs)).unwrap();
+                assert_eq!(report.missing_count, CHECK_BATCH + 1);
+            },
+        );
+        assert_eq!(calls.len(), 2);
     }
 }
